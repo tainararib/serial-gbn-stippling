@@ -1,0 +1,8 @@
+# Binários gerados pela compilação
+build/
+*.o
+
+# Configurações de editor e sistema
+.vscode/
+.idea/
+*.swp
