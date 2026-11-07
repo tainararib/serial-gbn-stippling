@@ -51,6 +51,8 @@ bool restrictToNonZero = false;
 bool randomOrder = false;
 bool transparent = true;
 Float power = 1;
+int kNeighbors = 2;                                                             // K: number of nearest points used to shape each kernel; 1 = original paper
+bool kMeanOfSquares = false;                                                    // false: (mean of K distances)^2; true: mean of K squared distances
 
 // =============================================================================
 // Utils
@@ -108,12 +110,13 @@ private:
     Float sigmaPixel;                                                           // Filtering sigma of pixels; mainly for testing; e.g. 0 means Dirac deltas
     std::vector<Float> bmp;                                                     // Pixels
     std::vector<Float> v;                                                       // kernel shaping factors (area)
-    std::vector<int> nearestNeighbor;                                           // Index of nearest neighbor
+    std::vector<int> knn;                                                       // For each point, indices of its K nearest points (N * K), nearest first; -1 if absent
+    std::vector<Float> knnDD;                                                   // Squared distances matching knn (N * K), ascending
     std::vector<int> neighbors;                                                 // List of considered neighbors for each site
     std::vector<int> indx0;                                                     // List of first index of each site in neighbors list
     Float unitArea, unitAreaInv;
     void init();                                                                // Initialize parameters and buffers
-    inline void updateKernel(int i);
+    void updateKernel(int i, bool searchAll = false);                           // Recompute K nearest and shaping factor of point i
     void initKernels();                                                         // Initialize kernel shaping factors
     int updateNeighborsList();
     // -------------------------------------------------------------------------
@@ -219,7 +222,8 @@ void GBNAdaptive::init() {
     unitAreaInv = 1 / unitArea;
     p.resize(N);
     v.resize(N);
-    nearestNeighbor.resize(N);
+    knn.resize(N * kNeighbors);
+    knnDD.resize(N * kNeighbors);
     neighbors.resize(500 * N);                                                  // Assuming 20x20 grid around each site plus a safety margin
     indx0.resize(N + 1);                                                        // We need to find the end for the last site.
     // -------------------------------------------------------------------------
@@ -299,40 +303,44 @@ int GBNAdaptive::updateNeighborsList() {
 // Update kernel shaping factor of a specific point
 // -------------------------------------------------------------------------
 
-void GBNAdaptive::updateKernel(int i) {
-    Float ddMin(1e12);
-    int minIndex(-1);
-    for (int k = indx0[i]; k < indx0[i+1]; k++) {
-        int j = neighbors[k];
-        Float dd = distSq(p[i], p[j]);
-        if (ddMin > dd) {
-            ddMin = dd;
-            minIndex = j;
+void GBNAdaptive::updateKernel(int i, bool searchAll) {
+    const int K = kNeighbors;
+    const bool useSq = kMeanOfSquares || K == 1;                                // For K = 1 both averages coincide; this avoids sqrt rounding noise
+    int *idx = &knn[i * K];
+    Float *dd = &knnDD[i * K];
+    for (int m = 0; m < K; m++) { idx[m] = -1; dd[m] = 1e12; }                  // Empty slots; kept sorted by ascending distance
+    auto consider = [&](int j) {                                                // Insert j in the sorted K-list if it is close enough
+        Float d2 = distSq(p[i], p[j]);
+        if (d2 >= dd[K - 1]) return;
+        int m = K - 1;
+        while (m > 0 && dd[m - 1] > d2) {                                       // Shift farther entries down
+            dd[m] = dd[m - 1];
+            idx[m] = idx[m - 1];
+            m--;
         }
-
+        dd[m] = d2;
+        idx[m] = j;
+    };
+    if (searchAll) { for (int j = 0; j < N; j++) if (j != i) consider(j); }     // Used at initialization, before neighbor lists exist
+    else {
+        for (int k = indx0[i]; k < indx0[i+1]; k++) consider(neighbors[k]);
     }
-    v[i] = ddMin * unitAreaInv;
-    nearestNeighbor[i] = minIndex;
+    int found(0);
+    Float sum(0);
+    for (int m = 0; m < K; m++) {
+        if (idx[m] < 0) break;
+        found++;
+        sum += useSq ? dd[m] : std::sqrt(dd[m]);
+    }
+    Float dEff = found ? sum / found : Float(1e12);                             // Average over the K nearest (or as many as exist)
+    v[i] = (useSq ? dEff : dEff * dEff) * unitAreaInv;
 }
 
 // -------------------------------------------------------------------------
 // Initialize kernel shaping factors
 // -------------------------------------------------------------------------
 void GBNAdaptive::initKernels() {
-    for (int i = 0; i < N; i++) {
-        Float ddMin(1e12);
-        int minIndex(-1);
-        for (int j = 0; j < N; j++) {
-            if (j == i) continue;
-            Float dd = distSq(p[i], p[j]);
-            if (ddMin > dd) {
-                ddMin = dd;
-                minIndex = j;
-            }
-        }
-        v[i] = ddMin * unitAreaInv;
-        nearestNeighbor[i] = minIndex;
-    }
+    for (int i = 0; i < N; i++) updateKernel(i, true);
 }
 
 // -----------------------------------------------------------------------------
@@ -484,25 +492,18 @@ void GBNAdaptive::optimize(int iterations) {
             // -----------------------------------------------------------------
             // Update shaping factor of self and affected neighbors
             // -----------------------------------------------------------------
-            Float ddMin(1e12);
-            int minIndex(-1);
-            for (int k = indx0[i]; k < indx0[i+1]; k++) {
+            updateKernel(i);                                                    // Own K nearest points and shaping factor
+            for (int k = indx0[i]; k < indx0[i+1]; k++) {                       // Neighbors whose K-nearest set may have changed
                 int j = neighbors[k];
                 Float dd = distSq(p[i], p[j]);
-                if (ddMin > dd) {
-                    ddMin = dd;
-                    minIndex = j;
+                bool isMember = false;                                          // Was/is p[i] among the K nearest of p[j]?
+                for (int m = 0; m < kNeighbors; m++) {
+                    if (knn[j * kNeighbors + m] == i) { isMember = true; break; }
                 }
-                if (dd * unitAreaInv < v[j]) {
-                    v[j] = dd * unitAreaInv;
-                    nearestNeighbor[j] = i;
-                }
-                if (nearestNeighbor[j] == i && dd * unitAreaInv > v[j]) {       // Was nearest neighbor and moved away
-                    updateKernel(j);                                            // Search for a new nearest neighbor
+                if (isMember || dd < knnDD[j * kNeighbors + kNeighbors - 1]) {  // Either its distance to j changed, or it entered j's K-set
+                    updateKernel(j);
                 }
             }
-            v[i] = ddMin * unitAreaInv;
-            nearestNeighbor[i] = minIndex;
         }
         if (parallelMode) {
             std::swap(p, pNext);                                                // Copy all new point locations
@@ -596,7 +597,8 @@ std::string GBNAdaptive::getParameters() {
         "scaling with v[i]^%0.1f, "
         "area pixels = %s, "
         "parallel mode = %s, "
-        "scanning order = %s, ",
+        "scanning order = %s, "
+        "K nearest = %d (%s), ",
         sigma * 2 * sqrt(unitAreaInv),
         sigmaPixel,
         timeStep,                                                               // * unitArea / (4 * sigma * sigma),
@@ -606,7 +608,9 @@ std::string GBNAdaptive::getParameters() {
         0.5 * scalingMode,
         areaPixels ? "true" : "false",
         parallelMode ? "true" : "false",
-        randomOrder ? "random" : "fixed"
+        randomOrder ? "random" : "fixed",
+        kNeighbors,
+        kMeanOfSquares ? "mean of squares" : "mean distance"
     );
     return buffer;
 }
@@ -772,6 +776,10 @@ const char *USAGE_MESSAGE =
 " -O                    Randomize scanning order; default is fixed order\n"
 " -Z                    Restrict movement to non-Zero pixels\n"
 " -o                    Make png plots opaque; default is transparent\n"
+" -K <k>                Shape kernels by the average distance to the K nearest "
+                       "points; default 2; 1 is the original paper\n"
+" -e                    With -K: average squared distances instead of "
+                       "distances\n"
 ;
 
 
@@ -791,7 +799,7 @@ int main(int argc,char **argv) {
     int frameCount = 0;
     while (
         (opt = getopt(
-            argc, argv, "g:G:AS:t:c:l:f:W:w:H:h:F:T:M:q:Q:I:X:ZOo")
+            argc, argv, "g:G:AS:t:c:l:f:W:w:H:h:F:T:M:q:Q:I:X:K:eZOo")
         ) != -1
     ) {
         switch (opt) {
@@ -815,6 +823,8 @@ int main(int argc,char **argv) {
             case 'Z': restrictToNonZero = true; break;
             case 'O': randomOrder = true; break;
             case 'o': transparent = false; break;
+            case 'K': kNeighbors = std::max(1, atoi(optarg)); break;
+            case 'e': kMeanOfSquares = true; break;
             default: fprintf(stderr, USAGE_MESSAGE, argv[0]); exit(1);
         }
     }
