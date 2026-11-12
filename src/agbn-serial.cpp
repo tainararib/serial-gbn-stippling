@@ -294,6 +294,9 @@ int GBNAdaptive::updateNeighborsList() {
             Float supportSq = supportSqRef * (v[i] + v[j]);
             Float rr = distSq(p[i], p[j]);
             if (rr < supportSq) {
+                if (k >= (int)neighbors.size()) {                               // Large K widens the kernels, hence the neighborhoods: grow the buffer if needed
+                    neighbors.resize(2 * neighbors.size());
+                }
                 neighbors[k++] = j;                                             // Register j as a neighbor of i.
             }
         }

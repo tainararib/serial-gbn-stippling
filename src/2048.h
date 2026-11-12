@@ -168,7 +168,7 @@ Points C2048::slice(int N) {
         int n;                                                                  // Number of points
     };
     std::vector<Record> stack;                                                  // LIFO, hence depth first
-    Rect rect = {0, w - 1, 0, h - 1};                                           // Initial region is whole image
+    Rect rect = {0, Float(w - 1), 0, Float(h - 1)};                                           // Initial region is whole image
     stack.push_back({rect, N});                                                 // And whole number of points
     while (!stack.empty()) {
         Rect rect = stack.back().rect;                                          // Retrieve topmost region
