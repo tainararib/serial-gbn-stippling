@@ -22,6 +22,10 @@
 #include <numeric>                                                              // For std::accumulate
 #include <algorithm>                                                            // For std::max_element
 #include <fstream>
+#include <chrono>                                                                // Wall-clock timing (clock() would add up the CPU time of all threads)
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define USE_DOUBLE
 
@@ -116,6 +120,7 @@ private:
     std::vector<int> indx0;                                                     // List of first index of each site in neighbors list
     Float unitArea, unitAreaInv;
     void init();                                                                // Initialize parameters and buffers
+    inline void setShape(int i);                                                // Shaping factor of point i from its stored K nearest distances
     void updateKernel(int i, bool searchAll = false);                           // Recompute K nearest and shaping factor of point i
     void initKernels();                                                         // Initialize kernel shaping factors
     int updateNeighborsList();
@@ -325,6 +330,14 @@ void GBNAdaptive::updateKernel(int i, bool searchAll) {
     else {
         for (int k = indx0[i]; k < indx0[i+1]; k++) consider(neighbors[k]);
     }
+    setShape(i);
+}
+
+void GBNAdaptive::setShape(int i) {
+    const int K = kNeighbors;
+    const bool useSq = kMeanOfSquares || K == 1;                                // For K = 1 both averages coincide; this avoids sqrt rounding noise
+    const int *idx = &knn[i * K];
+    const Float *dd = &knnDD[i * K];
     int found(0);
     Float sum(0);
     for (int m = 0; m < K; m++) {
@@ -340,6 +353,7 @@ void GBNAdaptive::updateKernel(int i, bool searchAll) {
 // Initialize kernel shaping factors
 // -------------------------------------------------------------------------
 void GBNAdaptive::initKernels() {
+    #pragma omp parallel for schedule(static) if(parallelMode)
     for (int i = 0; i < N; i++) updateKernel(i, true);
 }
 
@@ -392,7 +406,11 @@ void GBNAdaptive::optimize(int iterations) {
         }
         std::vector<int> order(N);
         if (randomOrder) shuffle(order);
-        for (int k = 0; k < N && !interruptFlag; k++) {                         // Iterate through all points
+        // In parallel mode (-P) all points are processed at once by several threads. In serial mode the
+        // 'if' clause makes this a single-thread loop, so the serial algorithm is unchanged.
+        #pragma omp parallel for schedule(dynamic, 32) if(parallelMode) firstprivate(gx, ex, gy, ey) private(gradLength) reduction(+:gradLengthSum, clampedCount) reduction(max:stepSqMax, gradLengthMax)
+        for (int k = 0; k < N; k++) {                                           // Iterate through all points
+            if (interruptFlag) continue;
             int i = randomOrder ? order[k] : k;
             if (parallelMode) pNext[i] = p[i];                                  // Fall back in case of exceptions
             Vector grad = {0, 0};                                               // Gradient
@@ -496,17 +514,33 @@ void GBNAdaptive::optimize(int iterations) {
             for (int k = indx0[i]; k < indx0[i+1]; k++) {                       // Neighbors whose K-nearest set may have changed
                 int j = neighbors[k];
                 Float dd = distSq(p[i], p[j]);
-                bool isMember = false;                                          // Was/is p[i] among the K nearest of p[j]?
+                int *idxJ = &knn[j * kNeighbors];
+                Float *ddJ = &knnDD[j * kNeighbors];
+                int slot = -1;                                                  // Position of p[i] among the K nearest of p[j], if any
                 for (int m = 0; m < kNeighbors; m++) {
-                    if (knn[j * kNeighbors + m] == i) { isMember = true; break; }
+                    if (idxJ[m] == i) { slot = m; break; }
                 }
-                if (isMember || dd < knnDD[j * kNeighbors + kNeighbors - 1]) {  // Either its distance to j changed, or it entered j's K-set
-                    updateKernel(j);
+                if (slot < 0 && dd >= ddJ[kNeighbors - 1]) continue;            // Not a member and still too far: nothing changes
+                if (slot >= 0 && dd > ddJ[slot]) {                              // Was a member and moved away: someone else may take its place
+                    updateKernel(j);                                            // Rescan the neighbor list
+                    continue;
                 }
+                if (slot < 0) {                                                 // Entered the K-set: it replaces the farthest member
+                    slot = kNeighbors - 1;
+                    idxJ[slot] = i;
+                }
+                ddJ[slot] = dd;                                                 // Member that stayed or came closer: only its distance changes
+                while (slot > 0 && ddJ[slot - 1] > ddJ[slot]) {                 // Restore ascending order
+                    std::swap(ddJ[slot - 1], ddJ[slot]);
+                    std::swap(idxJ[slot - 1], idxJ[slot]);
+                    slot--;
+                }
+                setShape(j);
             }
         }
         if (parallelMode) {
             std::swap(p, pNext);                                                // Copy all new point locations
+            #pragma omp parallel for schedule(static)
             for (int i = 0; i < N; i++) {
                 updateKernel(i);
             }
@@ -585,6 +619,10 @@ void GBNAdaptive::snapshot(int iteration) {
 
 std::string GBNAdaptive::getParameters() {
     char buffer[1024];
+    int threads = 1;
+#ifdef _OPENMP
+    if (parallelMode) threads = omp_get_max_threads();
+#endif
     sprintf(
         buffer,
         "Code file agbn-serial.cpp, "
@@ -598,7 +636,8 @@ std::string GBNAdaptive::getParameters() {
         "area pixels = %s, "
         "parallel mode = %s, "
         "scanning order = %s, "
-        "K nearest = %d (%s), ",
+        "K nearest = %d (%s), "
+        "threads = %d, ",
         sigma * 2 * sqrt(unitAreaInv),
         sigmaPixel,
         timeStep,                                                               // * unitArea / (4 * sigma * sigma),
@@ -610,7 +649,8 @@ std::string GBNAdaptive::getParameters() {
         parallelMode ? "true" : "false",
         randomOrder ? "random" : "fixed",
         kNeighbors,
-        kMeanOfSquares ? "mean of squares" : "mean distance"
+        kMeanOfSquares ? "mean of squares" : "mean distance",
+        threads
     );
     return buffer;
 }
@@ -776,6 +816,7 @@ const char *USAGE_MESSAGE =
 " -O                    Randomize scanning order; default is fixed order\n"
 " -Z                    Restrict movement to non-Zero pixels\n"
 " -o                    Make png plots opaque; default is transparent\n"
+" -J <threads>          Number of threads in parallel mode (-P); default is all cores\n"
 " -K <k>                Shape kernels by the average distance to the K nearest "
                        "points; default 2; 1 is the original paper\n"
 " -e                    With -K: average squared distances instead of "
@@ -799,7 +840,7 @@ int main(int argc,char **argv) {
     int frameCount = 0;
     while (
         (opt = getopt(
-            argc, argv, "g:G:AS:t:c:l:f:W:w:H:h:F:T:M:q:Q:I:X:K:eZOo")
+            argc, argv, "g:G:AS:t:c:l:f:W:w:H:h:F:T:M:q:Q:I:X:K:J:ePZOo")
         ) != -1
     ) {
         switch (opt) {
@@ -825,6 +866,14 @@ int main(int argc,char **argv) {
             case 'o': transparent = false; break;
             case 'K': kNeighbors = std::max(1, atoi(optarg)); break;
             case 'e': kMeanOfSquares = true; break;
+            case 'P': parallelMode = true; break;
+            case 'J':
+#ifdef _OPENMP
+                omp_set_num_threads(std::max(1, atoi(optarg)));
+#else
+                fprintf(stderr, "Warning: built without OpenMP, -J ignored\n");
+#endif
+                break;
             default: fprintf(stderr, USAGE_MESSAGE, argv[0]); exit(1);
         }
     }
@@ -851,10 +900,10 @@ int main(int argc,char **argv) {
     if (frameCount) gbn.setFrameCount(frameCount);
     if (W) gbn.setFrameSize(W, H);
     if (margin) gbn.setMargin(margin);
-    clock_t t0 = clock();
+    auto t0 = std::chrono::steady_clock::now();
     gbn.optimize(iterations);
-    clock_t t1 = clock();
-    double totalTime = (double)(t1 - t0) / CLOCKS_PER_SEC;
+    auto t1 = std::chrono::steady_clock::now();
+    double totalTime = std::chrono::duration<double>(t1 - t0).count();      // Wall-clock seconds
     fprintf(stderr, "\ndone! Total time = %.6fs\n", totalTime);
     // =========================================================================
     // Save point sets
