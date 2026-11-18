@@ -12,10 +12,10 @@ build/agbn-baseline: third_party/ahmed2024/agbn-serial.cpp third_party/ahmed2024
 > @mkdir -p build
 > $(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
 
-# Versão a ser modificada 
+# Versão a ser modificada (-fopenmp habilita o modo paralelo -P com várias threads)
 build/agbn-serial: src/agbn-serial.cpp src/common.h src/2048.h
 > @mkdir -p build
-> $(CXX) $(CXXFLAGS) -o $@ $< $(LDLIBS)
+> $(CXX) $(CXXFLAGS) -fopenmp -o $@ $< $(LDLIBS)
 
 clean:
 > rm -rf build

@@ -7,6 +7,5 @@ build/
 .idea/
 *.swp
 
-**/data/**
 **/results/**
 **/to_do*
